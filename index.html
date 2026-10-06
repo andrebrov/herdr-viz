@@ -1,0 +1,948 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Herdr Bridge</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; background: #090e13; }
+    body { display: grid; place-items: center; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    canvas { display: block; touch-action: none; cursor: crosshair; }
+    #status { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+  </style>
+</head>
+<body>
+  <canvas id="game" aria-label="Interactive fleet map. Click an agent to inspect it. Drag to pan."></canvas>
+  <div id="status" role="status" aria-live="polite"></div>
+  <script>
+  (() => {
+    'use strict';
+
+    const canvas = document.getElementById('game');
+    const ctx = canvas.getContext('2d', { alpha: false });
+    const statusText = document.getElementById('status');
+    const TILE = 16;
+    const HUD = 206;
+    const COLORS = {
+      claude:   { light: '#e7a66d', mid: '#ad6245', dark: '#693d39', accent: '#ffe0a8' },
+      codex:    { light: '#80d3b4', mid: '#397c70', dark: '#264d55', accent: '#d3ffe5' },
+      cursor:   { light: '#b2a4ec', mid: '#685baf', dark: '#393966', accent: '#e8dcff' },
+      opencode: { light: '#d3cf81', mid: '#8c8a46', dark: '#545632', accent: '#fff6b0' },
+      grok:     { light: '#ef8481', mid: '#a34654', dark: '#632d43', accent: '#ffcfb9' },
+      agy:      { light: '#82c5e9', mid: '#3d779f', dark: '#2a496c', accent: '#d1eeff' },
+      oss:      { light: '#c5a0df', mid: '#7a5799', dark: '#4c3d69', accent: '#f5d8ff' },
+      other:    { light: '#c7c7bd', mid: '#787f7c', dark: '#414b4b', accent: '#ffffff' },
+    };
+    const raceColor = kind => COLORS[kind] || COLORS.other;
+    const clamp = (n, a, b) => Math.max(a, Math.min(b, n));
+    const hash = (a, b = 0) => {
+      let n = (a * 374761393 + b * 668265263) | 0;
+      n = Math.imul(n ^ n >>> 13, 1274126177);
+      return ((n ^ n >>> 16) >>> 0) / 4294967295;
+    };
+    const short = (s, n) => s.length > n ? s.slice(0, n - 1) + '…' : s;
+    const displayName = a => a.name === '-' ? `unnamed (${a.kind})` : a.name;
+    const unitName = a => a.callsign || displayName(a);
+    const LOGOS = { claude: '✳', codex: '◎', cursor: '◆', opencode: '⌘',
+      grok: '✕', agy: '✦', oss: '◇', other: '◈' };
+    const logo = kind => LOGOS[kind] || LOGOS.other;
+    function fitText(value, width, size) {
+      ctx.font = `bold ${size}px monospace`;
+      const original = String(value);
+      if (ctx.measureText(original).width <= width) return original;
+      let label = original;
+      while (label.length && ctx.measureText(`${label}…`).width > width) label = label.slice(0, -1);
+      return `${label}…`;
+    }
+
+    let vw = 0, vh = 0, mapW = 0, mapH = 0, queueW = 0, dpr = 1, worldW = 1000, worldH = 650;
+    let cameraX = 0, cameraY = 0, terrain = null;
+    let agents = new Map(), selected = null, error = null, updatedAt = null;
+    let beans = new Map(), assignedBeans = new Map(), visibleQueue = [], beansError = null,
+      beansUpdatedAt = null, beansConfigured = false;
+    let hovered = null, inspectedBean = null;
+    let history = { standups: [], retros: [] }, historyError = null;
+    let sideTab = 'queue', sideOffset = 0, inspectorOffset = 0, reader = null;
+    let lastFrame = performance.now(), time = 0;
+    let pointer = null, hasDragged = false;
+
+    function resize() {
+      const firstLayout = !terrain;
+      vw = Math.floor(window.innerWidth);
+      vh = Math.floor(window.innerHeight);
+      dpr = window.devicePixelRatio || 1;
+      queueW = vw >= 1100 ? Math.min(350, Math.floor(vw * .24)) : 0;
+      mapW = vw - queueW;
+      mapH = vh - HUD;
+      canvas.width = Math.round(vw * dpr);
+      canvas.height = Math.round(vh * dpr);
+      canvas.style.width = `${vw}px`;
+      canvas.style.height = `${vh}px`;
+      ctx.scale(dpr, dpr);
+      ctx.imageSmoothingEnabled = false;
+      const oldW = worldW, oldH = worldH;
+      worldW = Math.max(1020, mapW);
+      worldH = Math.max(650, mapH);
+      if (oldW !== worldW || oldH !== worldH || !terrain) {
+        layoutAgents();
+        makeTerrain();
+      }
+      if (firstLayout) {
+        cameraX = Math.max(0, (worldW - mapW) / 2);
+        cameraY = Math.max(0, (worldH - mapH) / 2);
+      }
+      cameraX = clamp(cameraX, 0, Math.max(0, worldW - mapW));
+      cameraY = clamp(cameraY, 0, Math.max(0, worldH - mapH));
+    }
+
+    function layoutAgents() {
+      const list = [...agents.values()].sort((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id));
+      const columns = 6;
+      const rows = Math.max(1, Math.ceil(list.length / columns));
+      const rowHeight = Math.min(126, Math.floor((mapH - 60) / rows));
+      worldH = Math.max(worldH, 28 + rows * rowHeight);
+      const top = Math.max(45, Math.floor((worldH - rows * rowHeight) / 2));
+      const centralGap = 62;
+      const cellWidth = Math.floor((worldW - 24 - centralGap) / columns);
+      list.forEach((a, i) => {
+        const col = i % columns;
+        const row = Math.floor(i / columns);
+        const oldX = a.homeX, oldY = a.homeY;
+        a.cellWidth = cellWidth;
+        a.cellTop = top + row * rowHeight;
+        a.homeX = Math.round(12 + cellWidth * (col + 0.5) + (col >= 3 ? centralGap : 0));
+        a.homeY = a.cellTop + 54;
+        a.resourceX = Math.round(worldW / 2 + ((i % 5) - 2) * 25);
+        a.resourceY = 77 + (i % 3) * 9;
+        if (!Number.isFinite(a.x) || oldX !== a.homeX || oldY !== a.homeY) {
+          a.x = a.homeX;
+          a.y = a.homeY + 17;
+          a.legStartX = a.x;
+          a.legStartY = a.y;
+        }
+      });
+    }
+
+    function makeTerrain() {
+      terrain = document.createElement('canvas');
+      terrain.width = worldW;
+      terrain.height = worldH;
+      const g = terrain.getContext('2d');
+      g.fillStyle = '#28482f';
+      g.fillRect(0, 0, worldW, worldH);
+      for (let y = 0; y < worldH; y += TILE) {
+        for (let x = 0; x < worldW; x += TILE) {
+          const r = hash(x / TILE, y / TILE);
+          g.fillStyle = r < 0.2 ? '#2b4a2d' : r < 0.45 ? '#315332' : r < 0.78 ? '#2f5031' : '#365735';
+          g.fillRect(x, y, TILE, TILE);
+          if (r > 0.12) {
+            g.fillStyle = r > 0.73 ? '#4f6b3b' : '#3b6037';
+            g.fillRect(x + 2 + Math.floor(r * 6), y + 3, 2, 3);
+            g.fillRect(x + 9, y + 10, 1, 2);
+          }
+          if (r < 0.08) {
+            g.fillStyle = '#7b8067';
+            g.fillRect(x + 5, y + 7, 3, 2);
+            g.fillStyle = '#555e52';
+            g.fillRect(x + 7, y + 9, 2, 1);
+          }
+        }
+      }
+      const cx = worldW / 2;
+      // Short worn lanes stay inside each unit's cell.
+      g.lineCap = 'square';
+      for (const a of agents.values()) {
+        g.strokeStyle = '#516043';
+        g.lineWidth = 5;
+        g.beginPath();
+        g.moveTo(a.homeX, a.homeY + 17);
+        g.lineTo(a.homeX + (hash(a.name.length, 7) > .5 ? -24 : 24), a.homeY + 17);
+        g.stroke();
+        g.strokeStyle = '#77704d';
+        g.lineWidth = 2;
+        g.stroke();
+      }
+      // Tiny flowers and terrain glints remain behind the structures.
+      for (let i = 0; i < 140; i++) {
+        const x = Math.floor(hash(i, 20) * worldW), y = Math.floor(hash(i, 21) * worldH);
+        if (Math.abs(x - cx) < 65) continue;
+        g.fillStyle = i % 4 === 0 ? '#b3a563' : '#6c814a';
+        g.fillRect(x, y, 2, 2);
+      }
+    }
+
+    function receive(data) {
+      error = data.stale ? data.errorMessage || 'Status unavailable' : null;
+      updatedAt = data.updatedAt;
+      if (!Array.isArray(data.agents)) return;
+      const seen = new Set();
+      const occurrences = new Map();
+      for (const item of data.agents) {
+        const key = `${item.name}\u0000${item.pane}`;
+        const occurrence = occurrences.get(key) || 0;
+        occurrences.set(key, occurrence + 1);
+        const id = `${key}\u0000${occurrence}`;
+        seen.add(id);
+        const existing = agents.get(id);
+        if (existing) {
+          Object.assign(existing, item);
+          if (existing.state !== existing.previousState) {
+            existing.phase = 0;
+            if (existing.state === 'working') { existing.trip = 'out'; existing.cycle = 0; }
+            existing.tick = 0;
+            existing.legStartX = existing.x;
+            existing.legStartY = existing.y;
+            existing.previousState = existing.state;
+          }
+        } else {
+          agents.set(id, { ...item, id, x: NaN, y: NaN, phase: hash(seen.size, 3) * 6,
+            trip: 'out', previousState: item.state, tick: 0, cycle: 0, progress: 0 });
+        }
+      }
+      for (const id of agents.keys()) if (!seen.has(id)) agents.delete(id);
+      console.assert(agents.size === data.agents.length,
+        `Rendered unit count ${agents.size} differs from API agent count ${data.agents.length}`);
+      if (selected && !agents.has(selected)) selected = null;
+      layoutAgents();
+      makeTerrain();
+      statusText.textContent = `${agents.size} herdr agents. ${error ? `Status stale: ${error}` : 'Status live.'}`;
+    }
+
+    function receiveBeans(data) {
+      beansError = data.stale ? data.errorMessage || 'Beans unavailable' : null;
+      beansUpdatedAt = data.updatedAt;
+      beansConfigured = data.configured !== false;
+      if (Array.isArray(data.beans)) {
+        beans = new Map(data.beans.map(bean => [bean.id, bean]));
+        assignedBeans = new Map();
+        for (const bean of orderedBeans()) {
+          if (bean.current && bean.owner && !assignedBeans.has(bean.owner))
+            assignedBeans.set(bean.owner, bean);
+        }
+        visibleQueue = orderedBeans().filter(bean => bean.status === 'in-progress' ||
+          (bean.priority === 'critical' && !bean.owner && bean.status === 'todo'));
+      }
+    }
+
+    function receiveHistory(data) {
+      history = { standups: data.standups || [], retros: data.retros || [] };
+      historyError = data.stale ? data.errorMessage || 'History unavailable' : null;
+    }
+
+    const priorityRank = priority => ({ critical: 0, high: 1, normal: 2, low: 3 })[priority] ?? 4;
+    const orderedBeans = () => [...beans.values()].sort((a, b) =>
+      priorityRank(a.priority) - priorityRank(b.priority) || a.id.localeCompare(b.id));
+    function currentBean(a) { return assignedBeans.get(a.name); }
+
+    async function poll() {
+      try {
+        const response = await fetch('/api/status', { cache: 'no-store' });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        receive(await response.json());
+      } catch (e) {
+        error = e.message;
+        statusText.textContent = `Status unavailable: ${error}`;
+      }
+    }
+
+    async function pollBeans() {
+      try {
+        const response = await fetch('/api/beans', { cache: 'no-store' });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        receiveBeans(await response.json());
+      } catch (e) { beansError = e.message; }
+    }
+
+    async function pollHistory() {
+      try {
+        const response = await fetch('/api/history', { cache: 'no-store' });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        receiveHistory(await response.json());
+      } catch (e) { historyError = e.message; }
+    }
+
+    function move(a, targetX, targetY, dt, speed = 27) {
+      const dx = targetX - a.x, dy = targetY - a.y;
+      const distance = Math.hypot(dx, dy);
+      if (distance < 0.5) { a.x = targetX; a.y = targetY; return true; }
+      const step = Math.min(distance, speed * dt);
+      a.x += dx / distance * step;
+      a.y += dy / distance * step;
+      return step === distance;
+    }
+
+    function update(dt) {
+      const workers = [...agents.values()].filter(a => a.state === 'working')
+        .sort((a, b) => a.name.localeCompare(b.name));
+      const done = [...agents.values()].filter(a => a.state === 'done')
+        .sort((a, b) => a.name.localeCompare(b.name));
+      workers.forEach((a, index) => {
+        const spacing = Math.min(30, 250 / Math.max(1, workers.length - 1));
+        a.resourceX = Math.round(worldW / 2 + (index - (workers.length - 1) / 2) * spacing);
+        a.resourceY = 83;
+      });
+      for (const a of agents.values()) {
+        a.phase += dt;
+        if (a.state === 'working') {
+          const peer = agents.get(a.peerId);
+          const targetX = a.trip === 'out' ? a.resourceX :
+            a.trip === 'peer' && peer ? peer.homeX + 15 :
+            a.trip === 'bridge' ? worldW / 2 + ((workers.indexOf(a) % 5) - 2) * 12 : a.homeX;
+          const targetY = a.trip === 'out' ? a.resourceY :
+            a.trip === 'peer' && peer ? peer.homeY + 17 :
+            a.trip === 'bridge' ? worldH / 2 + 33 : a.homeY + 17;
+          const arrived = move(a, targetX, targetY, dt, 88);
+          a.moving = !arrived;
+          const total = Math.hypot(targetX - a.legStartX, targetY - a.legStartY) || 1;
+          a.progress = clamp(1 - Math.hypot(targetX - a.x, targetY - a.y) / total, 0, 1);
+          if (arrived) {
+            a.tick += dt;
+            if (a.tick > (a.trip === 'peer' || a.trip === 'bridge' ? .55 : .35)) {
+              if (a.trip === 'out') {
+                const index = workers.indexOf(a);
+                const next = workers.length > 1 ? workers[(index + 1) % workers.length] : null;
+                a.peerId = next?.id || null;
+                a.trip = a.cycle % 3 === 0 && next ? 'peer' :
+                  a.cycle % 3 === 1 ? 'bridge' : 'back';
+              } else if (a.trip === 'peer' || a.trip === 'bridge') {
+                a.trip = 'back';
+              } else {
+                a.trip = 'out';
+                a.cycle++;
+              }
+              a.tick = 0;
+              a.progress = 0;
+              a.legStartX = a.x;
+              a.legStartY = a.y;
+            }
+          }
+        } else if (a.state === 'done') {
+          const index = done.indexOf(a);
+          const angle = index * 2.39996;
+          const radius = 39 + Math.floor(index / 6) * 18;
+          const targetX = worldW / 2 + Math.round(Math.cos(angle) * radius);
+          const targetY = worldH / 2 + 24 + Math.round(Math.sin(angle) * radius * .55);
+          a.moving = !move(a, targetX, targetY, dt, 76);
+        } else if (a.state === 'idle' || a.state === 'missing') {
+          a.moving = !move(a, a.homeX, a.homeY + 17, dt, 48);
+        } else {
+          a.moving = false;
+        }
+      }
+    }
+
+    function rect(x, y, w, h, color) { ctx.fillStyle = color; ctx.fillRect(Math.round(x), Math.round(y), w, h); }
+    function txt(str, x, y, color = '#f3f2e9', size = 14, align = 'left') {
+      ctx.font = `bold ${size}px monospace`;
+      ctx.textAlign = align;
+      ctx.textBaseline = 'top';
+      ctx.fillStyle = color;
+      ctx.fillText(str, Math.round(x), Math.round(y));
+    }
+    function panel(x, y, w, h, fill = '#172137') {
+      rect(x, y, w, h, '#050813');
+      rect(x + 1, y + 1, w - 2, h - 2, '#746f9a');
+      rect(x + 2, y + 2, w - 4, h - 4, fill);
+      rect(x + 3, y + 3, w - 6, 1, '#a89bd2');
+      rect(x + 3, y + h - 4, w - 6, 1, '#101523');
+    }
+
+    function drawCrystal(x, y, size = 1, glow = false) {
+      x = Math.round(x); y = Math.round(y);
+      if (glow) rect(x - 5 * size, y - 4 * size, 10 * size, 9 * size, '#6d8d77');
+      rect(x - 2 * size, y - 4 * size, 4 * size, 2 * size, '#d9fcf1');
+      rect(x - 3 * size, y - 2 * size, 6 * size, 5 * size, '#7de9d9');
+      rect(x - 2 * size, y - 1 * size, 2 * size, 4 * size, '#bafcf1');
+      rect(x + 1 * size, y, 2 * size, 3 * size, '#38899e');
+      rect(x - 1 * size, y + 3 * size, 2 * size, 2 * size, '#488fa3');
+    }
+
+    function drawResources() {
+      const cx = worldW / 2;
+      rect(cx - 135, 71, 270, 23, '#315246');
+      drawCrystal(cx - 113, 83, 1, true);
+      drawCrystal(cx, 82, 1, true);
+      drawCrystal(cx + 113, 83, 1, true);
+      panel(cx - 89, 5, 178, 27, '#172b30');
+      txt('◈ CRYSTAL FIELD', cx, 11, '#d3fff1', 14, 'center');
+    }
+
+    function drawCommandCenter() {
+      const x = Math.round(worldW / 2), y = Math.round(worldH / 2);
+      rect(x - 23, y + 15, 46, 4, '#172725');
+      rect(x - 22, y - 4, 44, 21, '#4c5c5e');
+      rect(x - 18, y - 13, 36, 10, '#304651');
+      rect(x - 13, y - 17, 26, 4, '#a29368');
+      rect(x - 11, y - 8, 22, 3, '#6dbdb0');
+      rect(x - 7, y + 3, 14, 14, '#111e27');
+      rect(x - 5, y + 5, 10, 12, '#334b50');
+      panel(x - 40, y - 37, 80, 23, '#17282b');
+      txt('BRIDGE', x, y - 33, '#fff0ba', 14, 'center');
+    }
+
+    function drawBarrack(a) {
+      const x = Math.round(a.homeX), y = Math.round(a.homeY);
+      const missing = a.state === 'missing';
+      const p = missing ? { light: '#7e8780', mid: '#5c675f', dark: '#3a4845', accent: '#9aa79e' } : raceColor(a.kind);
+      rect(x - 24, y + 10, 48, 7, '#213329');
+      if (missing) {
+        rect(x - 20, y - 5, 40, 20, '#4a554f');
+        rect(x - 20, y - 9, 14, 5, '#6a7268');
+        rect(x + 5, y - 11, 11, 6, '#6a7268');
+        rect(x - 14, y + 3, 8, 12, '#2e3d3b');
+        rect(x + 2, y + 7, 14, 8, '#293a39');
+        rect(x - 24, y - 3, 7, 4, '#818b7c');
+        rect(x + 17, y + 9, 7, 5, '#818b7c');
+      } else {
+        rect(x - 22, y - 6, 44, 21, p.dark);
+        rect(x - 20, y - 10, 40, 7, p.mid);
+        rect(x - 15, y - 15, 30, 5, p.light);
+        rect(x - 9, y - 18, 18, 3, p.accent);
+        rect(x - 18, y - 3, 8, 6, p.mid);
+        rect(x + 10, y - 3, 8, 6, p.mid);
+        rect(x - 7, y + 1, 14, 14, '#17272d');
+        rect(x - 5, y + 3, 10, 12, '#59635c');
+        rect(x - 16, y - 7, 4, 3, p.accent);
+        rect(x + 12, y - 7, 4, 3, p.accent);
+      }
+      const cwd = a.cwd === '-' ? 'NO OUTPOST' : a.cwd;
+      const label = fitText(cwd, a.cellWidth - 12, 12);
+      ctx.font = 'bold 12px monospace';
+      const width = Math.ceil(ctx.measureText(label).width) + 8;
+      rect(x - width / 2, a.cellTop + 94, width, 17, missing ? '#25312e' : '#102126');
+      txt(label, x, a.cellTop + 96, missing ? '#d0d9d1' : '#f0f5e5', 12, 'center');
+      if (selected === a.id) {
+        ctx.strokeStyle = '#e8cf7d'; ctx.lineWidth = 1;
+        ctx.strokeRect(x - 25.5, y - 20.5, 51, 47);
+      }
+    }
+
+    function drawSprite(a) {
+      const x = Math.round(a.x), bob = a.state === 'idle' ? Math.sin(a.phase * 3 + hash(a.name.length) * 5) * 1.5 : 0;
+      const walking = a.moving && (a.state === 'working' || a.state === 'done' || a.state === 'idle');
+      const stride = walking ? Math.sin(a.phase * 13) * 2 : 0;
+      const y = Math.round(a.y + bob);
+      const missing = a.state === 'missing';
+      const p = missing ? { light: '#8b9690', mid: '#65746c', dark: '#3e504a', accent: '#a3ada5' } : raceColor(a.kind);
+      rect(x - 8, y + 1, 16, 3, '#162b28');
+      if (selected === a.id) {
+        ctx.strokeStyle = '#f5d986'; ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.ellipse(x, y + 1, 12, 5, 0, 0, Math.PI * 2); ctx.stroke();
+      }
+      // Each harness gets a distinct silhouette: horns, crest, visor, antennae, etc.
+      rect(x - 6, y - 4 + stride, 4, 5, p.dark);
+      rect(x + 2, y - 4 - stride, 4, 5, p.dark);
+      rect(x - 7, y - 14, 14, 11, p.dark);
+      rect(x - 5, y - 13, 10, 8, p.mid);
+      rect(x - 3, y - 11, 6, 5, p.light);
+      rect(x - 9, y - 13, 3, 8, p.mid);
+      rect(x + 6, y - 13, 3, 8, p.mid);
+      rect(x - 6, y - 22, 12, 8, p.dark);
+      rect(x - 5, y - 21, 10, 5, p.light);
+      if (a.kind === 'claude') {
+        rect(x - 8, y - 24, 4, 5, p.accent); rect(x + 4, y - 24, 4, 5, p.accent);
+        rect(x - 3, y - 19, 6, 2, '#462e35');
+      } else if (a.kind === 'codex') {
+        rect(x - 7, y - 22, 14, 3, p.accent); rect(x - 3, y - 18, 6, 2, '#163f49');
+      } else if (a.kind === 'cursor') {
+        rect(x - 2, y - 27, 4, 7, p.accent); rect(x - 4, y - 19, 8, 2, '#353352');
+      } else if (a.kind === 'grok') {
+        rect(x - 8, y - 23, 4, 4, p.accent); rect(x + 4, y - 23, 4, 4, p.accent);
+        rect(x - 3, y - 19, 6, 2, '#3b2536');
+      } else if (a.kind === 'agy') {
+        rect(x - 6, y - 24, 12, 3, p.accent); rect(x - 2, y - 27, 4, 3, p.mid);
+      } else if (a.kind === 'opencode') {
+        rect(x - 7, y - 23, 14, 3, p.mid); rect(x - 3, y - 19, 6, 2, p.accent);
+      } else {
+        rect(x - 5, y - 24, 10, 3, p.accent);
+      }
+      rect(x - 2, y - 8, 4, 3, p.accent);
+      if (a.state === 'working' && a.trip !== 'out') drawCrystal(x + 10, y - 14, 1, false);
+      if (a.state === 'working') {
+        rect(x - 12, y - 30, 24, 4, '#15252a');
+        rect(x - 11, y - 29, 22 * a.progress, 2, '#7dd5bd');
+        if (walking) {
+          rect(x - 11, y - 5, 2, 2, '#b4dcd8');
+          rect(x - 15, y - 3, 2, 2, '#7dada7');
+        }
+      }
+      if (a.state === 'done') {
+        rect(x + 7, y - 30, 12, 12, '#214d38');
+        txt('✓', x + 13, y - 30, '#d4ffd8', 14, 'center');
+      } else if (a.state === 'blocked') {
+        rect(x + 6, y - 32, 12, 13, '#9d3c3e');
+        txt('!', x + 12, y - 32, '#fff2d5', 14, 'center');
+      } else if (missing) {
+        txt('×', x + 12, y - 30, '#e1e9e0', 14, 'center');
+      }
+      const bean = currentBean(a);
+      if (bean) {
+        ctx.font = 'bold 12px monospace';
+        const cargoW = Math.min(a.cellWidth - 10, Math.ceil(ctx.measureText(bean.id).width) + 20);
+        const away = Math.hypot(a.x - a.homeX, a.y - (a.homeY + 17)) > 24;
+        const cargoX = away ? x : a.homeX;
+        const cargoY = away ? y + 8 : a.cellTop + 74;
+        rect(cargoX - cargoW / 2, cargoY, cargoW, 18,
+          bean.priority === 'critical' ? '#6a282b' : '#183c43');
+        rect(cargoX - cargoW / 2, cargoY, 4, 18,
+          bean.priority === 'critical' ? '#ff7775' : '#7de9d9');
+        txt(`◈ ${fitText(bean.id, cargoW - 8, 12)}`, cargoX, cargoY + 2,
+          '#ffffff', 12, 'center');
+      }
+      if (selected === a.id && Math.hypot(a.x - a.homeX, a.y - (a.homeY + 17)) > 35) {
+        const movingName = fitText(unitName(a), Math.max(72, a.cellWidth - 20), 14);
+        ctx.font = 'bold 14px monospace';
+        const movingW = Math.ceil(ctx.measureText(movingName).width) + 12;
+        rect(x - movingW / 2, y - 51, movingW, 19, '#090e19');
+        txt(movingName, x, y - 49, '#ffffff', 14, 'center');
+      }
+      const name = fitText(unitName(a), a.cellWidth - 36, 14);
+      const seat = a.callsign ? fitText(displayName(a), a.cellWidth - 36, 12) : null;
+      ctx.font = 'bold 14px monospace';
+      const nameWidth = ctx.measureText(name).width;
+      ctx.font = 'bold 12px monospace';
+      const labelWidth = Math.ceil(Math.max(nameWidth, seat ? ctx.measureText(seat).width : 0)) + 28;
+      const labelY = a.cellTop + 2;
+      const labelH = seat ? 37 : 21;
+      rect(a.homeX - labelWidth / 2, labelY, labelWidth, labelH, '#090e19');
+      rect(a.homeX - labelWidth / 2, labelY, 4, labelH, missing ? '#9ba7aa' : '#e4a66e');
+      txt(logo(a.kind), a.homeX - labelWidth / 2 + 14, labelY + 2,
+        missing ? '#adb8ba' : p.accent, 14, 'center');
+      txt(name, a.homeX + 7, labelY + 2, missing ? '#e1ebe3' : '#ffffff', 14, 'center');
+      if (seat) txt(seat, a.homeX + 7, labelY + 20, '#c5d5e5', 12, 'center');
+    }
+
+    function drawWorld() {
+      ctx.save();
+      ctx.beginPath(); ctx.rect(0, 0, mapW, mapH); ctx.clip();
+      ctx.translate(-Math.round(cameraX), -Math.round(cameraY));
+      if (terrain) ctx.drawImage(terrain, 0, 0);
+      drawResources();
+      drawCommandCenter();
+      const list = [...agents.values()].sort((a, b) => a.homeY - b.homeY);
+      for (const a of list) drawBarrack(a);
+      for (const a of [...agents.values()].sort((a, b) => a.y - b.y)) drawSprite(a);
+      ctx.restore();
+      // Vignette-like metal edge separates the map from the command HUD.
+      rect(0, mapH - 3, mapW, 3, '#0d1d23');
+      rect(0, mapH - 4, mapW, 1, '#83906b');
+    }
+
+    function drawHeader() {
+      panel(7, 5, 273, 29, '#181d34');
+      rect(10, 8, 6, 23, '#d29477');
+      txt('✦ HERDR / BRIDGE', 23, 10, '#ffe2b5', 16);
+      const text = error ? 'SIGNAL LOST  •  LAST KNOWN' : updatedAt ? '● LIVE FEED' : '◌ CONNECTING';
+      ctx.font = 'bold 14px monospace';
+      const width = Math.ceil(ctx.measureText(text).width) + 16;
+      panel(mapW - width - 7, 5, width, 28, error ? '#493130' : '#1b3340');
+      txt(text, mapW - width + 1, 11, error ? '#ffc6bf' : '#bcebf0', 14);
+    }
+
+    function drawMinimap() {
+      const w = 180, h = 130;
+      const x = vw - w - 7, y = vh - h - 7;
+      panel(x, y, w, h, '#1a302b');
+      const ix = x + 6, iy = y + 27, iw = w - 12, ih = h - 34;
+      rect(ix, iy, iw, ih, '#315438');
+      const px = wx => ix + wx / worldW * iw;
+      const py = wy => iy + wy / worldH * ih;
+      rect(px(worldW / 2) - 3, py(worldH / 2) - 2, 6, 5, '#e0bd76');
+      rect(px(worldW / 2) - 7, py(14) - 2, 14, 4, '#8ce1d4');
+      for (const a of agents.values()) {
+        const c = a.state === 'missing' ? '#72867e' : a.state === 'blocked' ? '#e77b75' : raceColor(a.kind).light;
+        rect(px(a.x) - 1, py(a.y) - 1, 3, 3, c);
+      }
+      ctx.strokeStyle = '#f3e3a7'; ctx.lineWidth = 1;
+      ctx.strokeRect(Math.round(px(cameraX)) + .5, Math.round(py(cameraY)) + .5,
+        Math.max(2, mapW / worldW * iw), Math.max(2, mapH / worldH * ih));
+      txt('SECTOR MAP', x + 9, y + 6, '#f3ffe0', 14);
+    }
+
+    function beanCounts() {
+      const today = new Date().toLocaleDateString();
+      const list = [...beans.values()];
+      return {
+        todo: list.filter(b => b.status === 'todo').length,
+        progress: list.filter(b => b.status === 'in-progress').length,
+        completed: list.filter(b => b.status === 'completed' && b.updatedAt &&
+          new Date(b.updatedAt).toLocaleDateString() === today).length,
+        parked: list.filter(b => b.status === 'blocked' || b.status === 'parked').length,
+        critical: list.filter(b => b.priority === 'critical' &&
+          b.status !== 'completed' && b.status !== 'scrapped').length,
+      };
+    }
+
+    const todayBeans = () => [...beans.values()].filter(bean => bean.status === 'completed' &&
+      bean.updatedAt && new Date(bean.updatedAt).toLocaleDateString() === new Date().toLocaleDateString())
+      .sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt));
+    const sideItems = () => sideTab === 'queue' ? visibleQueue : sideTab === 'today' ? todayBeans() :
+      sideTab === 'standup' ? history.standups : history.retros;
+    const sideTitle = () => ({ queue: '⚒ WORK QUEUE', today: '✓ DONE TODAY',
+      standup: '◈ STANDUP LOG', retro: '◈ RETRO ARCHIVE' })[sideTab];
+    const dateLabel = value => new Date(value).toLocaleString(undefined,
+      { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+
+    function drawQueue() {
+      if (!queueW) return;
+      const x = mapW;
+      rect(x, 0, queueW, mapH, '#090e1a');
+      rect(x, 0, 5, mapH, '#cf8b6c');
+      rect(x + 5, 0, 2, mapH, '#6d668e');
+      const list = sideItems();
+      panel(x + 10, 9, queueW - 20, 34, '#202039');
+      txt(sideTitle(), x + 20, 16, '#ffe2b5', 18);
+      txt(String(list.length), x + queueW - 20, 17, '#c6ecf0', 14, 'right');
+      const tabs = [['queue', 'QUEUE'], ['today', 'TODAY'], ['standup', 'STANDUP'], ['retro', 'RETRO']];
+      const tabW = (queueW - 20) / tabs.length;
+      tabs.forEach(([key, title], i) => {
+        const tx = x + 10 + i * tabW;
+        rect(tx, 48, tabW - 2, 28, key === sideTab ? '#c99680' : '#34334d');
+        txt(title, tx + (tabW - 2) / 2, 54,
+          key === sideTab ? '#11131e' : '#e9e4f3', 14, 'center');
+      });
+      const rowH = 68, startY = 85;
+      const visible = Math.max(1, Math.floor((mapH - startY - 8) / rowH));
+      sideOffset = clamp(sideOffset, 0, Math.max(0, list.length - visible));
+      if (!list.length) {
+        panel(x + 10, startY, queueW - 20, 63, '#1a2433');
+        txt(!beansConfigured && (sideTab === 'queue' || sideTab === 'today') ?
+          'SET BEANS_REPO TO CONNECT' : 'NO RECORDS IN THIS LOG',
+          x + 25, startY + 23, '#d7d4eb', 14);
+      }
+      for (let i = 0; i < visible && i + sideOffset < list.length; i++) {
+        const item = list[i + sideOffset], cy = startY + i * rowH;
+        if (sideTab !== 'queue') {
+          panel(x + 10, cy, queueW - 20, 63, '#1a2433');
+          rect(x + 14, cy + 5, 4, 53, sideTab === 'retro' ? '#aa9ad3' :
+            sideTab === 'standup' ? '#8ccee3' : '#9ad4ae');
+          txt(fitText(sideTab === 'today' ? item.id : dateLabel(item.updatedAt), queueW - 48, 14),
+            x + 25, cy + 7, '#ffe2b5', 14);
+          txt(fitText(item.title || 'UNTITLED', queueW - 48, 14),
+            x + 25, cy + 27, '#ffffff', 14);
+          txt(fitText(sideTab === 'today' ? dateLabel(item.updatedAt) : 'OPEN REPORT',
+            queueW - 48, 14), x + 25, cy + 46, '#acd8df', 14);
+          continue;
+        }
+        const bean = item;
+        const urgent = bean.priority === 'critical';
+        const flash = urgent && !bean.owner && Math.sin(time * 5) > 0;
+        panel(x + 10, cy, queueW - 20, 63,
+          flash ? '#6c3041' : urgent ? '#442d3e' : '#1a2433');
+        rect(x + 14, cy + 5, 4, 53, urgent ? '#ff7775' : bean.priority === 'high' ? '#e9ba6a' : '#7dbcb0');
+        txt(bean.id, x + 25, cy + 7, '#ffffff', 14);
+        txt(bean.priority.toUpperCase(), x + queueW - 20, cy + 7,
+          urgent ? '#ffaaa5' : '#f7d99c', 14, 'right');
+        txt(fitText(bean.title || 'UNTITLED', queueW - 47, 14), x + 25, cy + 26,
+          '#f3f4ed', 14);
+        txt(fitText(bean.owner || 'UNOWNED — ASSIGN UNIT', queueW - 47, 14),
+          x + 25, cy + 45, bean.owner ? '#b8e6d2' : '#ffbbb6', 14);
+      }
+      if ((sideTab === 'queue' || sideTab === 'today') && beansError ||
+          (sideTab === 'standup' || sideTab === 'retro') && historyError) {
+        panel(x + 12, mapH - 34, queueW - 24, 27, '#543030');
+        txt('DATA SIGNAL STALE', x + 22, mapH - 28, '#ffe1dc', 14);
+      }
+    }
+
+    function wrapText(value, width, size = 14) {
+      const limit = Math.max(12, Math.floor(width / (size * .61)));
+      const output = [];
+      for (let rest of String(value).split('\n')) {
+        if (!rest) { output.push(''); continue; }
+        while (rest.length > limit) {
+          let cut = rest.lastIndexOf(' ', limit);
+          if (cut < limit / 2) cut = limit;
+          output.push(rest.slice(0, cut).trimEnd());
+          rest = rest.slice(cut).trimStart();
+        }
+        output.push(rest);
+      }
+      return output;
+    }
+
+    function inspectionRows(width) {
+      const rows = [];
+      const add = (value, color = '#f0f7ee', size = 14) => {
+        for (const line of wrapText(value, width, size)) rows.push({ line, color, size });
+      };
+      const a = agents.get(selected);
+      if (a) {
+        const bean = currentBean(a);
+        add(`${logo(a.kind)} ${unitName(a).toUpperCase()}  /  ${displayName(a)}  /  ${a.kind.toUpperCase()}  /  ${a.state.toUpperCase()}`,
+          '#ffe2b5', 16);
+        if (bean) {
+          add(`${bean.id}  /  ${bean.status.toUpperCase()}  /  ${bean.priority.toUpperCase()}`,
+            bean.priority === 'critical' ? '#ffaaa5' : '#a9ffe5');
+          add(bean.title || 'UNTITLED BEAN', '#ffffff');
+        } else add('NO BEAN ASSIGNED', '#d6e0d8');
+        const peer = agents.get(a.peerId);
+        const route = a.state === 'working' ? a.trip === 'out' ? 'CRYSTAL FIELD' :
+          a.trip === 'peer' && peer ? `CREW VISIT: ${displayName(peer)}` :
+          a.trip === 'bridge' ? 'BRIDGE' : 'RETURNING TO OUTPOST' :
+          a.state === 'done' ? 'BRIDGE / WORK COMPLETE' :
+          a.state === 'blocked' ? 'PAUSED / BLOCKED' : 'OUTPOST';
+        add(`MAP ROUTE: ${route}`, '#bce3e8');
+        add(`MISSION: ${a.title || 'NO ACTIVE TITLE'}`);
+        add(`OUTPOST: ${a.cwd}`, '#b8dfe6');
+      } else if (inspectedBean && beans.has(inspectedBean)) {
+        const bean = beans.get(inspectedBean);
+        add(`${bean.id}  /  ${bean.priority.toUpperCase()}`, '#ffe2b5', 16);
+        add(bean.title || 'UNTITLED BEAN', '#ffffff');
+        add(`STATUS: ${bean.status.toUpperCase()}  /  UNIT: ${bean.owner || 'UNOWNED'}`, '#b8dfe6');
+      } else {
+        add('SELECT AN AGENT', '#ffe2b5', 18);
+        add('Click a unit or its cargo tag to inspect its current bean.');
+        add('Open TODAY, STANDUP, or RETRO in the right console.');
+        add('Scroll this panel to read long mission and bean text.', '#b8dfe6');
+      }
+      return rows;
+    }
+
+    function drawHud() {
+      const y = vh - HUD;
+      rect(0, y, vw, HUD, '#0a0e1b');
+      rect(0, y + 2, vw * .33, 5, '#d29477');
+      rect(vw * .33, y + 2, vw * .34, 5, '#a89bd2');
+      rect(vw * .67, y + 2, vw * .33, 5, '#8bc8da');
+      const resources = beanCounts();
+      panel(7, y + 10, vw - 14, 49, '#1a2134');
+      rect(10, y + 13, 5, 43, '#d29477');
+      txt('BEANS', 22, y + 24, '#ffe2b5', 16);
+      if (!beansConfigured) {
+        txt('OPTIONAL FEED • SET BEANS_REPO TO CONNECT', 104, y + 24, '#c4d6e9', 14);
+      } else {
+      const fields = [
+        ['TODO', resources.todo, '#e6eed9'],
+        ['IN PROGRESS', resources.progress, '#a9ffe5'],
+        ['COMPLETED TODAY', resources.completed, '#a9f5ae'],
+        ['BLOCKED / PARKED', resources.parked, '#ffbdad'],
+        ['CRITICAL', resources.critical, '#ff7775'],
+      ];
+      const startX = 94, fieldW = (vw - startX - 17) / fields.length;
+      fields.forEach(([label, count, color], i) => {
+        const fx = startX + i * fieldW;
+        txt(String(count), fx, y + 20, color, 22);
+        ctx.font = 'bold 22px monospace';
+        txt(label, fx + Math.ceil(ctx.measureText(String(count)).width) + 12,
+          y + 25, color, 14);
+      });
+      }
+      const leftW = 300;
+      panel(7, y + 66, leftW - 10, HUD - 73, '#1a2134');
+      rect(10, y + 69, 5, HUD - 79, '#a89bd2');
+      txt('CREW STATUS', 22, y + 74, '#ffe2b5', 16);
+      const counts = { working: 0, idle: 0, blocked: 0, missing: 0, done: 0 };
+      for (const a of agents.values()) counts[a.state] = (counts[a.state] || 0) + 1;
+      const cells = [
+        ['WORKING', counts.working, '#a4ffe9'],
+        ['IDLE', counts.idle, '#f7e5aa'],
+        ['BLOCKED', counts.blocked, '#ffc0b6'],
+        ['MISSING', counts.missing, '#d6e0d8'],
+      ];
+      cells.forEach((c, i) => {
+        const x = 18 + (i % 2) * 139;
+        const cy = y + 105 + Math.floor(i / 2) * 39;
+        txt(String(c[1]).padStart(2, '0'), x, cy, c[2], 22);
+        txt(c[0], x + 39, cy + 5, '#f1f6ec', 14);
+      });
+      const infoX = leftW + 2, infoW = vw - infoX - 195;
+      panel(infoX, y + 66, infoW, HUD - 73, '#1a2134');
+      rect(infoX + 3, y + 69, 5, HUD - 79, '#8bc8da');
+      const rows = inspectionRows(infoW - 34);
+      const top = y + 74, lineH = 22, visible = Math.floor((HUD - 87) / lineH);
+      inspectorOffset = clamp(inspectorOffset, 0, Math.max(0, rows.length - visible));
+      ctx.save();
+      ctx.beginPath(); ctx.rect(infoX + 11, top, infoW - 25, visible * lineH); ctx.clip();
+      for (let i = 0; i < visible && i + inspectorOffset < rows.length; i++) {
+        const row = rows[i + inspectorOffset];
+        txt(row.line, infoX + 14, top + i * lineH, row.color, row.size);
+      }
+      ctx.restore();
+      if (rows.length > visible) {
+        rect(infoX + infoW - 11, top, 4, visible * lineH, '#303d50');
+        rect(infoX + infoW - 11, top + inspectorOffset / rows.length * visible * lineH,
+          4, Math.max(12, visible / rows.length * visible * lineH), '#b9a8d9');
+      }
+    }
+
+    function drawBeanTooltip() {
+      if (!hovered || !beans.has(hovered.beanId)) return;
+      const bean = beans.get(hovered.beanId);
+      const width = Math.min(390, mapW - 20);
+      const x = clamp(hovered.x + 14, 8, mapW - width - 8);
+      const y = clamp(hovered.y + 12, 36, mapH - 94);
+      panel(x, y, width, 86, '#101e25');
+      txt(`${bean.id}  /  ${bean.priority.toUpperCase()}`, x + 11, y + 8,
+        bean.priority === 'critical' ? '#ffaaa5' : '#c0ffed', 14);
+      txt(fitText(bean.title || 'UNTITLED BEAN', width - 22, 14), x + 11, y + 32,
+        '#ffffff', 14);
+      txt(`${bean.status.toUpperCase()}  •  ${bean.owner || 'UNOWNED'}`, x + 11, y + 58,
+        '#d9ecdf', 14);
+    }
+
+    function readerGeometry() {
+      const x = Math.round(vw * .07), y = Math.round(vh * .06);
+      return { x, y, w: vw - 2 * x, h: vh - 2 * y };
+    }
+
+    function openReader(item) {
+      reader = { ...item, offset: 0, width: 0, lines: [] };
+      hovered = null;
+    }
+
+    function drawReader() {
+      if (!reader) return;
+      const { x, y, w, h } = readerGeometry();
+      rect(0, 0, vw, vh, 'rgba(3, 5, 12, .78)');
+      panel(x, y, w, h, '#111a2b');
+      rect(x + 4, y + 4, 9, h - 8, '#d29477');
+      rect(x + 16, y + 4, 4, h - 8, '#a89bd2');
+      txt(fitText(reader.title, w - 110, 18), x + 34, y + 14, '#ffe2b5', 18);
+      txt(dateLabel(reader.updatedAt), x + 34, y + 41, '#aee3ec', 14);
+      rect(x + w - 51, y + 10, 39, 32, '#b58478');
+      txt('×', x + w - 31, y + 15, '#10121e', 20, 'center');
+      const contentW = w - 75;
+      if (reader.width !== contentW) {
+        reader.lines = wrapText(reader.body, contentW, 14);
+        reader.width = contentW;
+      }
+      const top = y + 69, lineH = 21, visible = Math.max(1, Math.floor((h - 83) / lineH));
+      reader.offset = clamp(reader.offset, 0, Math.max(0, reader.lines.length - visible));
+      ctx.save();
+      ctx.beginPath(); ctx.rect(x + 32, top, contentW, visible * lineH); ctx.clip();
+      for (let i = 0; i < visible && i + reader.offset < reader.lines.length; i++) {
+        const line = reader.lines[i + reader.offset];
+        txt(line, x + 34, top + i * lineH,
+          line.startsWith('#') ? '#ffe2b5' : line.startsWith('-') ? '#bce3e8' : '#f0f2ef', 14);
+      }
+      ctx.restore();
+      if (reader.lines.length > visible) {
+        rect(x + w - 22, top, 5, visible * lineH, '#303d50');
+        rect(x + w - 22, top + reader.offset / reader.lines.length * visible * lineH,
+          5, Math.max(18, visible / reader.lines.length * visible * lineH), '#b9a8d9');
+      }
+    }
+
+    function frame(now) {
+      const dt = Math.min(0.05, (now - lastFrame) / 1000);
+      lastFrame = now;
+      time += dt;
+      update(dt);
+      ctx.fillStyle = '#152b2b'; ctx.fillRect(0, 0, vw, vh);
+      drawWorld();
+      drawHeader();
+      drawQueue();
+      drawHud();
+      drawMinimap();
+      drawBeanTooltip();
+      drawReader();
+      requestAnimationFrame(frame);
+    }
+
+    function point(event) {
+      const bounds = canvas.getBoundingClientRect();
+      return { x: event.clientX - bounds.left, y: event.clientY - bounds.top };
+    }
+    function unitAt(p) {
+      if (p.x >= mapW || p.y >= mapH) return null;
+      const wx = p.x + cameraX, wy = p.y + cameraY;
+      let closest = null, distance = 48;
+      for (const a of agents.values()) {
+        if (Math.abs(wx - a.homeX) < a.cellWidth / 2 - 5 &&
+          ((wy >= a.cellTop + 2 && wy <= a.cellTop + (a.callsign ? 39 : 23)) ||
+           (currentBean(a) && wy >= a.cellTop + 74 && wy <= a.cellTop + 92))) return a;
+        const d = Math.hypot(wx - a.x, wy - (a.y - 12));
+        if (d < distance) { distance = d; closest = a; }
+      }
+      return closest;
+    }
+    canvas.addEventListener('pointerdown', event => {
+      canvas.setPointerCapture(event.pointerId);
+      pointer = point(event); hasDragged = false;
+    });
+    canvas.addEventListener('pointermove', event => {
+      if (reader) return;
+      const p = point(event);
+      const unit = unitAt(p);
+      const bean = unit && currentBean(unit);
+      hovered = bean ? { beanId: bean.id, x: p.x, y: p.y } : null;
+      if (!pointer) return;
+      const dx = p.x - pointer.x, dy = p.y - pointer.y;
+      if (Math.abs(dx) + Math.abs(dy) > 1) hasDragged = true;
+      if (hasDragged && p.x < mapW && p.y < mapH) {
+        cameraX = clamp(cameraX - dx, 0, Math.max(0, worldW - mapW));
+        cameraY = clamp(cameraY - dy, 0, Math.max(0, worldH - mapH));
+      }
+      pointer = p;
+    });
+    canvas.addEventListener('pointerup', event => {
+      const p = point(event);
+      if (reader) {
+        const { x, y, w } = readerGeometry();
+        if (p.x >= x + w - 55 && p.x <= x + w - 7 && p.y >= y + 7 && p.y <= y + 48)
+          reader = null;
+        pointer = null;
+        return;
+      }
+      if (!hasDragged) {
+        const miniW = 180;
+        const miniX = vw - miniW - 7;
+        const miniY = vh - 137;
+        if (p.x >= miniX && p.y >= miniY && p.y <= miniY + 130) {
+          cameraX = clamp((p.x - miniX - 6) / (miniW - 12) * worldW - mapW / 2,
+            0, Math.max(0, worldW - mapW));
+          cameraY = clamp((p.y - miniY - 27) / 96 * worldH - mapH / 2,
+            0, Math.max(0, worldH - mapH));
+        } else if (queueW && p.x >= mapW && p.y < mapH) {
+          if (p.y >= 48 && p.y < 76) {
+            const tabs = ['queue', 'today', 'standup', 'retro'];
+            const tab = Math.floor((p.x - mapW - 10) / ((queueW - 20) / 4));
+            if (tabs[tab]) { sideTab = tabs[tab]; sideOffset = 0; }
+          } else {
+            const row = Math.floor((p.y - 85) / 68);
+            const item = sideItems()[sideOffset + row];
+            if (row >= 0 && item) {
+              if (sideTab === 'standup' || sideTab === 'retro') openReader(item);
+              else { inspectedBean = item.id; selected = null; inspectorOffset = 0; }
+            }
+          }
+        } else {
+          const unit = unitAt(p);
+          if (unit) { selected = unit.id; inspectedBean = null; inspectorOffset = 0; }
+        }
+      }
+      pointer = null;
+    });
+    canvas.addEventListener('pointercancel', () => { pointer = null; });
+    canvas.addEventListener('pointerleave', () => { hovered = null; });
+    canvas.addEventListener('wheel', event => {
+      const p = point(event);
+      if (reader) {
+        reader.offset += Math.sign(event.deltaY) * 3;
+        event.preventDefault();
+      } else if (queueW && p.x >= mapW && p.y < mapH) {
+        sideOffset += Math.sign(event.deltaY);
+        event.preventDefault();
+      } else if (p.x >= 302 && p.x <= vw - 195 && p.y >= vh - HUD + 66 && p.y <= vh - 7) {
+        inspectorOffset += Math.sign(event.deltaY);
+        event.preventDefault();
+      }
+    }, { passive: false });
+    window.addEventListener('keydown', event => { if (event.key === 'Escape') reader = null; });
+    window.addEventListener('resize', resize);
+
+    resize();
+    poll();
+    pollBeans();
+    pollHistory();
+    setInterval(poll, 5000);
+    setInterval(pollBeans, 30000);
+    setInterval(pollHistory, 30000);
+    requestAnimationFrame(frame);
+  })();
+  </script>
+</body>
+</html>
