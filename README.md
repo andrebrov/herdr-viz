@@ -29,7 +29,9 @@ RETRO_DIR=/path/to/retros \
 node server.mjs
 ```
 
-`BEANS_REPO` enables `beans list --json` in that directory. The assignments directory is optional: each file is named for a seat, and its second whitespace-separated field is the bean ID held by that seat. The optional owners directory contains a file named for each bean with the owner seat inside. Set `BEANS_BIN` if `beans` is not on `PATH` or in `~/go/bin` or `~/.local/bin`.
+`BEANS_REPO` enables `beans list --json` in that directory. Seat assignments default to `~/.local/share/fleet-tasks` and owner files to `~/.local/share/fleet-watch/state/owner`; set the directory variables above if your layout differs. Each assignment file is named for a seat, and its second whitespace-separated field is the bean ID held by that seat. Each owner file is named for a bean and contains its owner seat. Set `BEANS_BIN` if `beans` is not on `PATH` or in `~/go/bin` or `~/.local/bin`.
+
+The queue shows epic and milestone containers as group headers with their open-child counts and owner, then nests active child work beneath them. Containers never appear as unowned-unit alerts or unit cargo. Child counts use parent links in the read-only beans list.
 
 `STANDUP_DIR` and `RETRO_DIR` are optional directories of Markdown files. Filenames start with `standup-` and `retro-` respectively; both may point to one shared directory. The page shows the 20 most recently modified files from each directory. All integrations are read-only. The server keeps its last good data when a command fails.
 

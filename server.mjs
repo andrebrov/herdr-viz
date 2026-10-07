@@ -11,8 +11,8 @@ const port = Number(process.env.PORT || 4777);
 const refreshMs = 5000;
 const beansRefreshMs = 30000;
 const beansRepo = process.env.BEANS_REPO || null;
-const tasksDir = process.env.BEANS_TASKS_DIR || null;
-const ownersDir = process.env.BEANS_OWNERS_DIR || null;
+const tasksDir = process.env.BEANS_TASKS_DIR || join(homedir(), '.local/share/fleet-tasks');
+const ownersDir = process.env.BEANS_OWNERS_DIR || join(homedir(), '.local/share/fleet-watch/state/owner');
 const callsignsPath = process.env.HERDR_CALLSIGNS_FILE || join(homedir(), '.config/herdr/callsigns.tsv');
 const reportsDir = process.env.STANDUP_DIR || null;
 const retrosDir = process.env.RETRO_DIR || null;
@@ -115,36 +115,53 @@ function response() {
 }
 
 async function readAssignments() {
-  const assignments = new Map();
+  const ledger = new Map();
+  const owners = new Map();
   const current = new Set();
-  const seats = tasksDir ? await readdir(tasksDir).catch(() => []) : [];
+  const seats = await readdir(tasksDir).catch(() => []);
   for (const seat of seats) {
     const line = await readFile(join(tasksDir, seat), 'utf8').catch(() => '');
     const bean = line.trim().split(/\s+/)[1];
     if (bean && bean !== 'none' && bean !== 'self-serve') {
-      assignments.set(bean, seat);
+      ledger.set(bean, seat);
       current.add(bean);
     }
   }
-  const ownerFiles = ownersDir ? await readdir(ownersDir).catch(() => []) : [];
+  const ownerFiles = await readdir(ownersDir).catch(() => []);
   for (const bean of ownerFiles) {
-    if (assignments.has(bean)) continue;
     const owner = (await readFile(join(ownersDir, bean), 'utf8').catch(() => '')).trim();
-    if (owner) assignments.set(bean, owner);
+    if (owner) owners.set(bean, owner);
   }
-  return { assignments, current };
+  return { ledger, owners, current };
 }
 
+const beansCandidates = () => process.env.BEANS_BIN ? [process.env.BEANS_BIN] :
+  ['beans', join(homedir(), 'go/bin/beans'), join(homedir(), '.local/bin/beans')];
+
 function runBeans() {
-  const candidates = process.env.BEANS_BIN ? [process.env.BEANS_BIN] :
-    ['beans', join(homedir(), 'go/bin/beans'), join(homedir(), '.local/bin/beans')];
-  return runCommand(candidates, ['list', '--json'], {
-    cwd: beansRepo, timeout: 12000, maxBuffer: 32 * 1024 * 1024,
+  return runCommand(beansCandidates(), ['list', '--json'], {
+    cwd: beansRepo, timeout: 60000, maxBuffer: 32 * 1024 * 1024,
   }).then(output => {
     const records = JSON.parse(output);
     if (!Array.isArray(records)) throw new Error('beans list returned a non-array');
     return records;
   });
+}
+
+export function parseBeanRelationships(records) {
+  const parentById = new Map();
+  const openChildrenById = new Map();
+  for (const bean of records) {
+    if (bean?.id && (bean.type === 'epic' || bean.type === 'milestone'))
+      openChildrenById.set(bean.id, 0);
+  }
+  for (const bean of records) {
+    if (!bean?.id || !bean.parent || !openChildrenById.has(bean.parent)) continue;
+    parentById.set(bean.id, bean.parent);
+    if (bean.status !== 'completed' && bean.status !== 'scrapped')
+      openChildrenById.set(bean.parent, openChildrenById.get(bean.parent) + 1);
+  }
+  return { parentById, openChildrenById };
 }
 
 function beansResponse() {
@@ -165,15 +182,21 @@ export async function getBeans() {
   if (Date.now() - beansLastAttempt < beansRefreshMs) return beansResponse();
   beansLastAttempt = Date.now();
   beansPending = Promise.all([runBeans(), readAssignments()])
-    .then(([records, { assignments, current }]) => {
+    .then(([records, { ledger, owners, current }]) => {
+      const relationships = parseBeanRelationships(records);
       beansLastGood = records.filter(bean => bean && typeof bean.id === 'string').map(bean => ({
         id: bean.id,
         title: bean.title || '',
         status: bean.status || '',
         priority: bean.priority || 'normal',
         type: bean.type || 'task',
-        owner: assignments.get(bean.id) || (typeof bean.owner === 'string' ? bean.owner : null),
-        current: current.has(bean.id),
+        owner: (bean.type === 'epic' || bean.type === 'milestone' ? owners.get(bean.id) :
+          ledger.get(bean.id) || owners.get(bean.id)) ||
+          (typeof bean.owner === 'string' ? bean.owner : null),
+        current: bean.type !== 'epic' && bean.type !== 'milestone' && current.has(bean.id),
+        parentId: relationships?.parentById.get(bean.id) || null,
+        openChildren: bean.type === 'epic' || bean.type === 'milestone' ?
+          relationships?.openChildrenById.get(bean.id) ?? null : null,
         updatedAt: bean.updated_at || null,
       }));
       beansLastUpdatedAt = new Date().toISOString();

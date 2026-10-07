@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
-import { parseHerdrAgents } from './server.mjs';
+import { parseHerdrAgents, parseBeanRelationships } from './server.mjs';
 
 const parsed = parseHerdrAgents(JSON.stringify({ result: { agents: [{ name: 'claude-pm',
   agent: 'claude', agent_status: 'working', pane_id: 'pane-1', cwd: '/work/demo',
@@ -9,6 +9,15 @@ const parsed = parseHerdrAgents(JSON.stringify({ result: { agents: [{ name: 'cla
   JSON.stringify({ result: { workspaces: [{ workspace_id: 'workspace-1', label: 'Sulu · claude-pm' }] } }));
 assert.deepEqual(parsed[0], { name: 'claude-pm', kind: 'claude', state: 'working',
   pane: 'pane-1', cwd: 'demo', title: 'Plan release', callsign: 'Sulu' });
+const relations = parseBeanRelationships([
+  { id: 'work-epic', type: 'epic' },
+  { id: 'work-open', parent: 'work-epic', status: 'todo' },
+  { id: 'work-draft', parent: 'work-epic', status: 'draft' },
+  { id: 'work-done', parent: 'work-epic', status: 'completed' },
+  { id: 'work-scrapped', parent: 'work-epic', status: 'scrapped' },
+]);
+assert.equal(relations.openChildrenById.get('work-epic'), 2);
+assert.equal(relations.parentById.get('work-open'), 'work-epic');
 
 const kinds = ['claude', 'codex', 'cursor', 'opencode', 'grok', 'agy', 'oss'];
 const states = ['working', 'idle', 'done', 'blocked', 'missing'];
@@ -46,6 +55,12 @@ const script = originalScript
         priority: 'critical', owner: null, current: false },
       { id: 'work-done', title: 'Finished today', status: 'completed',
         priority: 'normal', owner: 'claude-pm', updatedAt: new Date().toISOString() },
+      { id: 'work-epic', title: 'Project container', type: 'epic', status: 'todo',
+        priority: 'critical', owner: 'claude-coder', current: true, openChildren: 2 },
+      { id: 'work-milestone', title: 'Release milestone', type: 'milestone', status: 'todo',
+        priority: 'critical', owner: null, openChildren: 1 },
+      { id: 'work-child', title: 'Build the child task', type: 'task', status: 'in-progress',
+        priority: 'high', owner: 'architect', parentId: 'work-epic' },
     ], updatedAt: 'fixture', stale: false })});`)
   .replace('    pollHistory();',
     `    receiveHistory(${JSON.stringify({ standups: [{ id: 'standup-test.md',
@@ -54,7 +69,7 @@ const script = originalScript
         body: '# Retro test\nA lesson.' }] })});`)
   .replace('    function drawSprite(a) {', '    function drawSprite(a) { window.__drawn.push(a.id);')
   .replace('    requestAnimationFrame(frame);\n  })();',
-    '    window.__fleetTest = { agents, fitText, displayName, unitName, currentBean, inspectionRows, update, receive, getWorld: () => ({ w: worldW, h: worldH }), getReader: () => reader };\n' +
+    '    window.__fleetTest = { agents, fitText, displayName, unitName, currentBean, inspectionRows, update, receive, getQueue: () => visibleQueue, beanCounts, getWorld: () => ({ w: worldW, h: worldH }), getReader: () => reader };\n' +
     '    requestAnimationFrame(frame);\n  })();');
 assert.notEqual(script, originalScript);
 
@@ -106,12 +121,21 @@ function render(width, height, dpr) {
   assert.equal(context.imageSmoothingEnabled, false);
 
   const { agents, fitText, displayName, unitName, currentBean, inspectionRows,
-    update, receive, getWorld, getReader } = window.__fleetTest;
+    update, receive, getQueue, beanCounts, getWorld, getReader } = window.__fleetTest;
   assert.equal(agents.size, fixture.length, 'one unit per API agent');
   assert.equal(drawn.length, fixture.length, 'every unit was drawn');
   assert.equal(new Set(drawn).size, fixture.length, 'every drawn unit is distinct');
   assert.equal(currentBean([...agents.values()].find(a => a.name === 'claude-coder')).id,
-    'work-current', 'ledger assignment wins over an older owner record');
+    'work-current', 'containers never become unit cargo, even with a current owner');
+  assert.equal(beanCounts().critical, 2, 'critical alerts count work items, not containers');
+  assert.ok(getQueue().some(item => item.id === 'work-epic' && item.openChildren === 2));
+  assert.ok(getQueue().some(item => item.id === 'work-milestone' && item.openChildren === 1));
+  assert.ok(getQueue().findIndex(item => item.id === 'work-epic') <
+    getQueue().findIndex(item => item.id === 'work-child'), 'child work follows its group header');
+  assert.ok(renderedText.some(t => t.text === 'EPIC  /  2 OPEN CHILDREN'));
+  assert.ok(renderedText.some(t => t.text.includes('work-epic') && t.text.includes('OWNER: claude-coder')));
+  assert.ok(renderedText.some(t => t.text.includes('UNOWNED — ASSIGN UNIT')),
+    'unowned critical work still has an alert');
   assert.ok(renderedText.some(t => t.text.includes('work-current')),
     'current bean cargo is visible');
   assert.ok(renderedText.some(t => t.text === '⚒ WORK QUEUE'), 'work queue is visible');
@@ -151,6 +175,11 @@ function render(width, height, dpr) {
   assert.ok(renderedText.some(t => t.text === 'Sulu' && t.size === 14));
   assert.ok(renderedText.some(t => t.text === 'Scotty' && t.size === 14));
   assert.ok(renderedText.some(t => t.text === '✳' && t.size === 14));
+  const queueX = width - Math.min(350, Math.floor(width * .24));
+  handlers.pointerdown({ pointerId: 6, clientX: queueX + 40, clientY: 100 });
+  handlers.pointerup({ clientX: queueX + 40, clientY: 100 });
+  assert.ok(inspectionRows(width - 497 - 34).map(row => row.line).join(' ').includes('2 OPEN CHILDREN'),
+    'clicking a container shows its child count in the inspector');
   const unit = [...agents.values()].find(agent => agent.name === 'claude-coder');
   handlers.pointerdown({ pointerId: 1, clientX: unit.x, clientY: unit.y - 12 });
   handlers.pointerup({ clientX: unit.x, clientY: unit.y - 12 });

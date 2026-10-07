@@ -218,11 +218,10 @@
         beans = new Map(data.beans.map(bean => [bean.id, bean]));
         assignedBeans = new Map();
         for (const bean of orderedBeans()) {
-          if (bean.current && bean.owner && !assignedBeans.has(bean.owner))
+          if (!isContainer(bean) && bean.current && bean.owner && !assignedBeans.has(bean.owner))
             assignedBeans.set(bean.owner, bean);
         }
-        visibleQueue = orderedBeans().filter(bean => bean.status === 'in-progress' ||
-          (bean.priority === 'critical' && !bean.owner && bean.status === 'todo'));
+        visibleQueue = buildQueue();
       }
     }
 
@@ -232,9 +231,37 @@
     }
 
     const priorityRank = priority => ({ critical: 0, high: 1, normal: 2, low: 3 })[priority] ?? 4;
+    const isContainer = bean => bean.type === 'epic' || bean.type === 'milestone';
+    const isOpen = bean => bean.status !== 'completed' && bean.status !== 'scrapped';
     const orderedBeans = () => [...beans.values()].sort((a, b) =>
       priorityRank(a.priority) - priorityRank(b.priority) || a.id.localeCompare(b.id));
     function currentBean(a) { return assignedBeans.get(a.name); }
+
+    function buildQueue() {
+      const candidates = orderedBeans().filter(bean => isContainer(bean) ? isOpen(bean) :
+        bean.status === 'in-progress' ||
+        (bean.priority === 'critical' && !bean.owner && bean.status === 'todo'));
+      const ids = new Set(candidates.map(bean => bean.id));
+      const children = new Map();
+      for (const bean of candidates) {
+        const parent = bean.parentId && ids.has(bean.parentId) ? bean.parentId : null;
+        if (!children.has(parent)) children.set(parent, []);
+        children.get(parent).push(bean);
+      }
+      const compare = (a, b) => priorityRank(a.priority) - priorityRank(b.priority) ||
+        Number(isContainer(b)) - Number(isContainer(a)) || a.id.localeCompare(b.id);
+      const rows = [], seen = new Set();
+      function append(parent, depth) {
+        for (const bean of (children.get(parent) || []).sort(compare)) {
+          if (seen.has(bean.id)) continue;
+          seen.add(bean.id);
+          rows.push({ ...bean, queueDepth: depth });
+          append(bean.id, depth + 1);
+        }
+      }
+      append(null, 0);
+      return rows;
+    }
 
     async function poll() {
       try {
@@ -570,8 +597,7 @@
         completed: list.filter(b => b.status === 'completed' && b.updatedAt &&
           new Date(b.updatedAt).toLocaleDateString() === today).length,
         parked: list.filter(b => b.status === 'blocked' || b.status === 'parked').length,
-        critical: list.filter(b => b.priority === 'critical' &&
-          b.status !== 'completed' && b.status !== 'scrapped').length,
+        critical: list.filter(b => !isContainer(b) && b.priority === 'critical' && isOpen(b)).length,
       };
     }
 
@@ -594,7 +620,8 @@
       const list = sideItems();
       panel(x + 10, 9, queueW - 20, 34, '#202039');
       txt(sideTitle(), x + 20, 16, '#ffe2b5', 18);
-      txt(String(list.length), x + queueW - 20, 17, '#c6ecf0', 14, 'right');
+      txt(String(sideTab === 'queue' ? list.filter(item => !isContainer(item)).length : list.length),
+        x + queueW - 20, 17, '#c6ecf0', 14, 'right');
       const tabs = [['queue', 'QUEUE'], ['today', 'TODAY'], ['standup', 'STANDUP'], ['retro', 'RETRO']];
       const tabW = (queueW - 20) / tabs.length;
       tabs.forEach(([key, title], i) => {
@@ -627,18 +654,30 @@
           continue;
         }
         const bean = item;
+        if (isContainer(bean)) {
+          panel(x + 10, cy, queueW - 20, 63, '#28283f');
+          rect(x + 14, cy + 5, 4, 53, '#ad9bd3');
+          txt(`${bean.type.toUpperCase()}  /  ${bean.openChildren ?? '?'} OPEN CHILDREN`,
+            x + 25, cy + 7, '#d8caff', 14);
+          txt(fitText(bean.title || 'UNTITLED', queueW - 48, 14),
+            x + 25, cy + 26, '#ffffff', 14);
+          txt(fitText(`${bean.id}  ·  OWNER: ${bean.owner || '—'}`, queueW - 48, 14),
+            x + 25, cy + 45, '#bfd2e6', 14);
+          continue;
+        }
         const urgent = bean.priority === 'critical';
         const flash = urgent && !bean.owner && Math.sin(time * 5) > 0;
         panel(x + 10, cy, queueW - 20, 63,
           flash ? '#6c3041' : urgent ? '#442d3e' : '#1a2433');
         rect(x + 14, cy + 5, 4, 53, urgent ? '#ff7775' : bean.priority === 'high' ? '#e9ba6a' : '#7dbcb0');
-        txt(bean.id, x + 25, cy + 7, '#ffffff', 14);
+        const inset = bean.queueDepth ? Math.min(12, bean.queueDepth * 8) : 0;
+        txt(bean.id, x + 25 + inset, cy + 7, '#ffffff', 14);
         txt(bean.priority.toUpperCase(), x + queueW - 20, cy + 7,
           urgent ? '#ffaaa5' : '#f7d99c', 14, 'right');
-        txt(fitText(bean.title || 'UNTITLED', queueW - 47, 14), x + 25, cy + 26,
+        txt(fitText(bean.title || 'UNTITLED', queueW - 47 - inset, 14), x + 25 + inset, cy + 26,
           '#f3f4ed', 14);
-        txt(fitText(bean.owner || 'UNOWNED — ASSIGN UNIT', queueW - 47, 14),
-          x + 25, cy + 45, bean.owner ? '#b8e6d2' : '#ffbbb6', 14);
+        txt(fitText(bean.owner || 'UNOWNED — ASSIGN UNIT', queueW - 47 - inset, 14),
+          x + 25 + inset, cy + 45, bean.owner ? '#b8e6d2' : '#ffbbb6', 14);
       }
       if ((sideTab === 'queue' || sideTab === 'today') && beansError ||
           (sideTab === 'standup' || sideTab === 'retro') && historyError) {
@@ -691,7 +730,11 @@
         const bean = beans.get(inspectedBean);
         add(`${bean.id}  /  ${bean.priority.toUpperCase()}`, '#ffe2b5', 16);
         add(bean.title || 'UNTITLED BEAN', '#ffffff');
-        add(`STATUS: ${bean.status.toUpperCase()}  /  UNIT: ${bean.owner || 'UNOWNED'}`, '#b8dfe6');
+        if (isContainer(bean)) {
+          add(`${bean.type.toUpperCase()}  /  ${bean.status.toUpperCase()}  /  ` +
+            `${bean.openChildren ?? '?'} OPEN CHILDREN`, '#b8dfe6');
+          add(`OWNER: ${bean.owner || '—'}`, '#b8dfe6');
+        } else add(`STATUS: ${bean.status.toUpperCase()}  /  UNIT: ${bean.owner || 'UNOWNED'}`, '#b8dfe6');
       } else {
         add('SELECT AN AGENT', '#ffe2b5', 18);
         add('Click a unit or its cargo tag to inspect its current bean.');
